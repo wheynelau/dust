@@ -7,7 +7,7 @@ use std::{io, str};
 static INIT: Once = Once::new();
 static UNREADABLE_DIR_PATH: &str = "/tmp/unreadable_dir";
 
-/**
+/*
  * This file contains tests that verify the exact output of the command.
  * This output differs on Linux / Mac so the tests are harder to write and debug
  * Windows is ignored here because the results vary by host making exact testing impractical
@@ -42,7 +42,7 @@ fn create_unreadable_directory() -> io::Result<()> {
         use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(UNREADABLE_DIR_PATH)?;
-        fs::set_permissions(UNREADABLE_DIR_PATH, Permissions::from_mode(0))?;
+        fs::set_permissions(UNREADABLE_DIR_PATH, Permissions::from_mode(0o0))?;
     }
     Ok(())
 }

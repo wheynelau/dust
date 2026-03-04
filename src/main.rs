@@ -170,7 +170,7 @@ fn main() {
         config.get_force_colors(&options),
     );
 
-    let ignore_directories = match options.ignore_directory {
+    let mut ignore_directories = match options.ignore_directory {
         Some(ref values) => values
             .iter()
             .map(PathBuf::from)
@@ -178,6 +178,8 @@ fn main() {
             .collect::<Vec<PathBuf>>(),
         None => vec![],
     };
+    #[cfg(target_os = "macos")]
+    platform::expand_with_firmlinks(&mut ignore_directories);
 
     let ignore_from_file_result = match options.ignore_all_in_file {
         Some(ref val) => read_to_string(val)

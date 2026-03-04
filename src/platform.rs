@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use std::fs;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_family = "unix")]
 fn get_block_size() -> u64 {
@@ -213,5 +213,225 @@ pub fn get_metadata<P: AsRef<Path>>(
             }
         }
         _ => get_metadata_expensive(path, use_apparent_size),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn expand_with_firmlinks(paths: &mut Vec<PathBuf>) {
+    let Ok(content) = std::fs::read_to_string("/usr/share/firmlinks") else {
+        return;
+    };
+
+    let firmlinks: Vec<(PathBuf, PathBuf)> = get_firmlinked_paths(content);
+
+    let extras = expand_firmlinks_inner(paths, &firmlinks);
+
+    paths.extend(extras);
+}
+
+// this calls try_match_path on both the original path and the canonicalized path
+#[cfg(target_os = "macos")]
+fn expand_firmlinks_inner(paths: &[PathBuf], firmlinks: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            // Try matching original path first
+            if let Some(expanded) = try_match_path(path, firmlinks) {
+                return Some(expanded);
+            }
+
+            // If no match, try canonicalizing the path (resolves .. components)
+            // e.g., /bin/../Users -> /Users
+            if let Ok(canonical) = std::fs::canonicalize(path)
+                && let Some(expanded) = try_match_path(&canonical, firmlinks)
+            {
+                return Some(expanded);
+            }
+
+            None
+        })
+        .collect()
+}
+/// Given a path to ignore and a list of firmlinks, try to find a corresponding path on the other side of the firmlink.
+/// For example, if the path is /System/Library and there is a firmlink mapping /System/Library to /System/Volumes/Data/System/Library,
+/// then this function will return /System/Volumes/Data/System/Library.
+/// The role of this is expanding the paths, so that both sides of the firmlink are considered when we check if a file is ignored or not.
+#[cfg(target_os = "macos")]
+fn try_match_path(path: &Path, firmlinks: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    firmlinks.iter().find_map(|(src, dst)| {
+        if path.starts_with(src) {
+            Some(dst.join(path.strip_prefix(src).unwrap()))
+        } else if path.starts_with(dst) {
+            Some(src.join(path.strip_prefix(dst).unwrap()))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn get_firmlinked_paths(firmlink_string: String) -> Vec<(PathBuf, PathBuf)> {
+    firmlink_string
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let src = PathBuf::from(parts.next()?);
+            let dst = PathBuf::from("/System/Volumes/Data").join(parts.next()?);
+            Some((src, dst))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_firmlinked_paths() {
+        let firmlink_string = "/System/Library\t/System/Volumes/Data/System/Library\n/Applications\t/System/Volumes/Data/Applications";
+        let expected = vec![
+            (
+                PathBuf::from("/System/Library"),
+                PathBuf::from("/System/Volumes/Data/System/Library"),
+            ),
+            (
+                PathBuf::from("/Applications"),
+                PathBuf::from("/System/Volumes/Data/Applications"),
+            ),
+        ];
+        assert_eq!(get_firmlinked_paths(firmlink_string.to_string()), expected);
+    }
+
+    #[test]
+    fn test_expand_firmlinks_with_absolute_path() {
+        // Simple test, you run -X Users with the input path of /
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("/Users")];
+        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        assert!(
+            extras.contains(&PathBuf::from("/System/Volumes/Data/Users")),
+            "Expected /System/Volumes/Data/Users in extras, got: {:?}",
+            extras
+        );
+    }
+
+    #[test]
+    fn test_expand_firmlinks_with_nested_absolute_path() {
+        // Test with nested absolute path - should work
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("/Users/employee")];
+        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        assert!(
+            extras.contains(&PathBuf::from("/System/Volumes/Data/Users/employee")),
+            "Expected /System/Volumes/Data/Users/employee in extras, got: {:?}",
+            extras
+        );
+    }
+
+    #[test]
+    fn test_expand_firmlinks_with_relative_path() {
+        // Test with relative path like ./Users - should NOT match
+        // ./Users is relative to CWD, NOT equivalent to /Users
+        // This also means that if the user runs ./Users in /, it will break
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("./Users")];
+        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        assert!(
+            extras.is_empty(),
+            "Relative path ./Users should NOT match firmlink /Users, got: {:?}",
+            extras
+        );
+    }
+
+    #[test]
+    fn test_expand_firmlinks_with_parent_path() {
+        // Test with parent path like /bin/../Users - NOW FIXED
+        // Parent paths should now canonicalize and match firmlinks
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("/bin/../Users")];
+        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        assert!(
+            extras.contains(&PathBuf::from("/System/Volumes/Data/Users")),
+            "Path /bin/../Users should canonicalize and match firmlink /Users, got: {:?}",
+            extras
+        );
+    }
+
+    #[test]
+    fn test_expand_firmlinks_with_dst_side() {
+        // Test matching against the dst side of firmlink
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("/System/Volumes/Data/Users")];
+        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        assert!(
+            extras.contains(&PathBuf::from("/Users")),
+            "Expected /Users in extras, got: {:?}",
+            extras
+        );
+    }
+
+    #[test]
+    fn test_try_match_path_logic() {
+        let firmlinks = vec![
+            (
+                PathBuf::from("/Users"),
+                PathBuf::from("/System/Volumes/Data/Users"),
+            ),
+            (
+                PathBuf::from("/usr/local"),
+                PathBuf::from("/System/Volumes/Data/usr/local"),
+            ),
+        ];
+
+        // 1. Map from system path to data volume path
+        assert_eq!(
+            try_match_path(Path::new("/Users/employee/projects"), &firmlinks),
+            Some(PathBuf::from(
+                "/System/Volumes/Data/Users/employee/projects"
+            ))
+        );
+
+        // 2. Map from data volume path back to system path
+        assert_eq!(
+            try_match_path(
+                Path::new("/System/Volumes/Data/Users/employee/projects"),
+                &firmlinks
+            ),
+            Some(PathBuf::from("/Users/employee/projects"))
+        );
+
+        // 3. Map second firmlink entry (/usr/local)
+        assert_eq!(
+            try_match_path(Path::new("/usr/local/bin/rustc"), &firmlinks),
+            Some(PathBuf::from("/System/Volumes/Data/usr/local/bin/rustc"))
+        );
+
+        // 4. Exact match on the firmlink root
+        assert_eq!(
+            try_match_path(Path::new("/Users"), &firmlinks),
+            Some(PathBuf::from("/System/Volumes/Data/Users"))
+        );
+
+        // 5. Path that does not exist in firmlinks
+        assert_eq!(
+            try_match_path(Path::new("/System/Library/CoreServices"), &firmlinks),
+            None
+        );
     }
 }
