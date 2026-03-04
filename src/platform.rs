@@ -224,14 +224,19 @@ pub fn expand_with_firmlinks(paths: &mut Vec<PathBuf>) {
 
     let firmlinks: Vec<(PathBuf, PathBuf)> = get_firmlinked_paths(content);
 
-    let extras = expand_firmlinks_inner(paths, &firmlinks);
+    let cwd = std::env::current_dir().ok();
+    let extras = expand_firmlinks_inner(paths, &firmlinks, cwd.as_ref());
 
     paths.extend(extras);
 }
 
 // this calls try_match_path on both the original path and the canonicalized path
 #[cfg(target_os = "macos")]
-fn expand_firmlinks_inner(paths: &[PathBuf], firmlinks: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+fn expand_firmlinks_inner(
+    paths: &[PathBuf],
+    firmlinks: &[(PathBuf, PathBuf)],
+    cwd: Option<&PathBuf>,
+) -> Vec<PathBuf> {
     paths
         .iter()
         .filter_map(|path| {
@@ -240,9 +245,20 @@ fn expand_firmlinks_inner(paths: &[PathBuf], firmlinks: &[(PathBuf, PathBuf)]) -
                 return Some(expanded);
             }
 
-            // If no match, try canonicalizing the path (resolves .. components)
-            // e.g., /bin/../Users -> /Users
-            if let Ok(canonical) = std::fs::canonicalize(path)
+            // For relative paths, join with CWD to make them absolute
+            let path_to_canonicalize = if !path.is_absolute() {
+                if let Some(cwd) = cwd {
+                    cwd.join(path)
+                } else {
+                    return None;
+                }
+            } else {
+                path.clone()
+            };
+
+            // Try canonicalizing (resolves .. components)
+            // e.g., ../Users (from /bin) -> /bin/../Users -> /Users
+            if let Ok(canonical) = std::fs::canonicalize(&path_to_canonicalize)
                 && let Some(expanded) = try_match_path(&canonical, firmlinks)
             {
                 return Some(expanded);
@@ -311,7 +327,7 @@ mod tests {
             PathBuf::from("/System/Volumes/Data/Users"),
         )];
         let paths: Vec<PathBuf> = vec![PathBuf::from("/Users")];
-        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, None);
         assert!(
             extras.contains(&PathBuf::from("/System/Volumes/Data/Users")),
             "Expected /System/Volumes/Data/Users in extras, got: {:?}",
@@ -327,7 +343,7 @@ mod tests {
             PathBuf::from("/System/Volumes/Data/Users"),
         )];
         let paths: Vec<PathBuf> = vec![PathBuf::from("/Users/employee")];
-        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, None);
         assert!(
             extras.contains(&PathBuf::from("/System/Volumes/Data/Users/employee")),
             "Expected /System/Volumes/Data/Users/employee in extras, got: {:?}",
@@ -345,7 +361,7 @@ mod tests {
             PathBuf::from("/System/Volumes/Data/Users"),
         )];
         let paths: Vec<PathBuf> = vec![PathBuf::from("./Users")];
-        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, None);
         assert!(
             extras.is_empty(),
             "Relative path ./Users should NOT match firmlink /Users, got: {:?}",
@@ -362,7 +378,7 @@ mod tests {
             PathBuf::from("/System/Volumes/Data/Users"),
         )];
         let paths: Vec<PathBuf> = vec![PathBuf::from("/bin/../Users")];
-        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, None);
         assert!(
             extras.contains(&PathBuf::from("/System/Volumes/Data/Users")),
             "Path /bin/../Users should canonicalize and match firmlink /Users, got: {:?}",
@@ -378,10 +394,29 @@ mod tests {
             PathBuf::from("/System/Volumes/Data/Users"),
         )];
         let paths: Vec<PathBuf> = vec![PathBuf::from("/System/Volumes/Data/Users")];
-        let extras = expand_firmlinks_inner(&paths, &firmlinks);
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, None);
         assert!(
             extras.contains(&PathBuf::from("/Users")),
             "Expected /Users in extras, got: {:?}",
+            extras
+        );
+    }
+    #[test]
+    fn test_expand_firmlinks_with_cwd() {
+        // Test: ../Users with CWD=/bin should resolve to /Users
+        // This simulates: user runs `dust -X Users ../` from /bin directory
+        let firmlinks = vec![(
+            PathBuf::from("/Users"),
+            PathBuf::from("/System/Volumes/Data/Users"),
+        )];
+        let paths: Vec<PathBuf> = vec![PathBuf::from("../Users")];
+        let mock_cwd = PathBuf::from("/bin");
+
+        // With mock CWD, ../Users becomes /bin/../Users which canonicalizes to /Users
+        let extras = expand_firmlinks_inner(&paths, &firmlinks, Some(&mock_cwd));
+        assert!(
+            extras.contains(&PathBuf::from("/System/Volumes/Data/Users")),
+            "Expected ../Users (from /bin) to resolve to /Users and match firmlink, got: {:?}",
             extras
         );
     }
